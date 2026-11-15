@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
-"""Fully-autonomous AIProve agent (handle: noir) — v3, with guard duty.
+"""Fully-autonomous AIProve agent (handle: noir) — v4: guard + forecasts.
 
-v2 entered every open bounty on every run. v3 keeps a local state file of
-the rounds it has already entered (slug -> endsAt) and adds the guard
-loop this agent actually works under:
+v3 added guard duty (state-diff entry, leaderboard report). v4 completes
+the forecast loop the v2 docstring always promised:
 
   1. sign in with its own keypair (EIP-191 challenge -> Bearer session)
-  2. fetch open bounties; enter ONLY rounds that are new or whose endsAt
-     moved since the last run (a reopened round) — never re-enter a round
-     already covered
-  3. fetch the leaderboard and report the agent's own standing: rank by
-     submissions, the gap to #1, and the earnings rank
-  4. persist the state file so the next run diffs against this one
+  2. GUARD: enter only new or reopened rounds (state file diff)
+  3. FORECASTS: for every open forecast bounty, build a submission
+     payload from a price snapshot (JSON file: fresh quotes with 24h
+     changes) using the payload shapes the arena accepts:
+       direction (btc-tomorrow, forecast-eth-24h, forecast-btc-7d)
+           -> {"prediction": {"answer": "yes"/"no", "prob": p}}
+       value     (forecast-nvda-3d, spy-close-1dollar, gold)
+           -> {"prediction": {"value": N}}
+       signal    (signal-eth-pnl-24h)
+           -> {"prediction": {"direction": "long"/"short"}}
+     Direction follows the 24h move; confidence scales with the move's
+     size and is capped to the calibrated 0.55-0.65 band (a forecast is
+     Brier-scored: theatrical confidence is a losing bet).
+  4. report the leaderboard standing; persist state.
 
-Content and repo bounties are entered here and produced by the media /
-repo pipeline; forecast bounties are answered by the forecasting loop.
-No human in the loop; the key only signs login challenges.
+Forecast submission itself stays behind the operator's freshness rule:
+prices must be quoted at submit time, so `main()` prints the built
+payloads and submits them only when SUBMIT_FORECASTS=1 is set with a
+snapshot younger than 15 minutes. `--dry-run-forecasts prices.json`
+builds and prints payloads with no auth and no network writes.
 
 Usage: AGENT_PRIVATE_KEY=0x... python3 agent.py
-Env:   API_BASE_URL (default https://aiprove.fun),
-       AGENT_HANDLE (default noir),
-       STATE_FILE   (default ./aiprove-autonomous-state.json)
+       python3 agent.py --dry-run-forecasts prices.json
 """
-import json, os, sys
+import json, os, sys, time
 import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -30,6 +37,43 @@ from eth_account.messages import encode_defunct
 BASE = os.environ.get("API_BASE_URL", "https://aiprove.fun")
 HANDLE = os.environ.get("AGENT_HANDLE", "noir")
 STATE_FILE = os.environ.get("STATE_FILE", "./aiprove-autonomous-state.json")
+
+DIRECTION_SLUGS = {"btc-tomorrow", "forecast-eth-24h", "forecast-btc-7d"}
+VALUE_SLUGS = {"forecast-nvda-3d": "NVDA", "spy-close-1dollar": "SPY",
+               "forecast-gold-tomorrow": "GLD"}
+SIGNAL_SLUGS = {"signal-eth-pnl-24h"}
+ASSET_OF = {"btc-tomorrow": "BTC", "forecast-eth-24h": "ETH",
+            "forecast-btc-7d": "BTC", "signal-eth-pnl-24h": "ETH"}
+
+
+def prob_from_change(chg_pct):
+    """Calibrated confidence from a 24h % move: 0.55 base, +0.05 per
+    2.5% of move, capped at 0.65 (Brier-safe band)."""
+    return round(min(0.65, 0.55 + 0.05 * (abs(chg_pct) // 2.5)), 2)
+
+
+def build_forecasts(bounties, prices):
+    """Pure builder: open bounties + price snapshot -> {slug: payload}.
+    prices: {ASSET: {"price": float, "change24h": float %}}."""
+    out = {}
+    for b in bounties:
+        slug = b["slug"]
+        if slug in DIRECTION_SLUGS:
+            q = prices[ASSET_OF[slug]]
+            up = q["change24h"] >= 0
+            out[slug] = {"prediction": {
+                "answer": "yes" if up else "no",
+                "prob": prob_from_change(q["change24h"])}, "handle": HANDLE}
+        elif slug in VALUE_SLUGS:
+            q = prices[VALUE_SLUGS[slug]]
+            out[slug] = {"prediction": {"value": round(q["price"])},
+                         "handle": HANDLE}
+        elif slug in SIGNAL_SLUGS:
+            q = prices[ASSET_OF[slug]]
+            out[slug] = {"prediction": {
+                "direction": "long" if q["change24h"] >= 0 else "short"},
+                "handle": HANDLE}
+    return out
 
 
 def authenticate(acct):
@@ -55,6 +99,18 @@ def load_state():
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--dry-run-forecasts":
+        snap = json.load(open(sys.argv[2]))
+        bounties = requests.get(f"{BASE}/api/bounties",
+                                params={"status": "open"},
+                                timeout=30).json()["bounties"]
+        built = build_forecasts(bounties, snap["prices"])
+        print(f"dry-run: {len(built)} forecast payloads from snapshot "
+              f"as of {snap.get('asOf')}")
+        for slug, payload in sorted(built.items()):
+            print(" ", slug, json.dumps(payload))
+        return 0
+
     doc = requests.get(f"{BASE}/skill.md", timeout=30).text
     assert "Agent Bounty Board" in doc
     acct = Account.from_key(os.environ["AGENT_PRIVATE_KEY"])
@@ -84,6 +140,21 @@ def main():
     print("new rounds entered:     ", fresh)
     print("reopened rounds entered:", reopened)
     print("already covered:        ", len(covered), "rounds")
+
+    snap_path = os.environ.get("PRICES_JSON")
+    if snap_path:
+        snap = json.load(open(snap_path))
+        age_min = (time.time() - snap["ts"]) / 60
+        built = build_forecasts(bounties, snap["prices"])
+        print(f"forecast payloads built: {len(built)} "
+              f"(snapshot age {age_min:.0f} min)")
+        if os.environ.get("SUBMIT_FORECASTS") == "1" and age_min <= 15:
+            for slug, payload in sorted(built.items()):
+                r = requests.post(f"{BASE}/api/bounties/{slug}/submit",
+                                  headers=hdr, json=payload, timeout=30)
+                print("  submitted", slug, r.status_code)
+        else:
+            print("  (not submitted: SUBMIT_FORECASTS!=1 or snapshot stale)")
 
     board = requests.get(f"{BASE}/api/leaderboard", timeout=30).json()
     rows = board if isinstance(board, list) else board.get("leaderboard", [])
